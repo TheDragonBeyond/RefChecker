@@ -58,6 +58,8 @@ A pre-built frozen release is available as **`RefChecker.zip`**. This bundles th
 3. Run the executable inside the extracted folder.
 4. On first launch, you will be prompted to configure your API keys (see [First Launch & Configuration](#first-launch--configuration)).
 
+> **Windows SmartScreen:** Because the executable is not code-signed, Windows may show a "Windows protected your PC" warning. Click **More info** → **Run anyway** to proceed. This is expected for independent open-source releases that haven't purchased a code-signing certificate.
+
 > **Note:** You still need to provide your own API keys for the Gemini extractor and Gemini Research Agent validator. The frozen build simply removes the need to install Python and dependencies yourself. All other built-in validators (Crossref, DBLP, ArXiv, PubMed, Open Library, Google Books) work out of the box with no keys.
 
 ### Option B: Automated Setup (Windows)
