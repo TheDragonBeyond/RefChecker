@@ -165,7 +165,7 @@ NOTE: The built-in plugins are bundled inside the application.
       plugins, as this will cause duplicate loading warnings.
 """
 
-with open(os.path.join(plugins_path, "README.txt"), "w") as f:
+with open(os.path.join(plugins_path, "README.md"), "w") as f:
     f.write(readme_text)
 
 print(f"\nBuild Complete!")
