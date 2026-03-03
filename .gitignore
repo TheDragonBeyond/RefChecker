@@ -217,8 +217,12 @@ fabric.properties
 # Project Specific
 app_icon.ico
 Citation Unified.lnk
+RefChecker.lnk
 Citation_validation_icon.ico
+RefChecker_icon.ico
 CitationUnified.bat
+RefChecker.bat
 CitationUnified.spec
+RefChecker.spec
 
 # End of https://mrkandreev.name/snippets/gitignore-generator/#Python,PyCharm

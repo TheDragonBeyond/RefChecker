@@ -1,9 +1,9 @@
 @echo off
-TITLE Citation Unified Installer
+TITLE RefChecker Installer
 CLS
 
 ECHO ========================================================
-ECHO    Citation Unified - Automated Installer (Windows)
+ECHO    RefChecker - Automated Installer (Windows)
 ECHO ========================================================
 ECHO.
 
@@ -60,18 +60,18 @@ if exist requirements.txt (
 )
 
 :: 4. Create a Launcher Script
-ECHO [3/5] Creating startup launcher (CitationUnified.bat)...
+ECHO [3/5] Creating startup launcher (RefChecker.bat)...
 (
 echo @echo off
 echo call "%%~dp0venv\Scripts\activate.bat"
 echo python "%%~dp0app.py"
 echo IF %%ERRORLEVEL%% NEQ 0 PAUSE
-) > CitationUnified.bat
+) > RefChecker.bat
 
 :: 5. Create a Windows shortcut with icon (if icon exists)
 ECHO [4/5] Creating desktop-friendly shortcut...
-SET ICON_FILE=Citation_validation_icon.png
-SET ICO_FILE=Citation_validation_icon.ico
+SET ICON_FILE=RefChecker_icon.png
+SET ICO_FILE=RefChecker_icon.ico
 
 :: Generate .ico from .png using Python/Pillow (if available)
 IF EXIST "%ICON_FILE%" (
@@ -81,18 +81,18 @@ IF EXIST "%ICON_FILE%" (
         :: Create a VBScript to generate a .lnk shortcut with the icon
         > create_shortcut.vbs (
             echo Set ws = CreateObject("WScript.Shell"^)
-            echo Set shortcut = ws.CreateShortcut(ws.CurrentDirectory ^& "\Citation Unified.lnk"^)
-            echo shortcut.TargetPath = ws.CurrentDirectory ^& "\CitationUnified.bat"
+            echo Set shortcut = ws.CreateShortcut(ws.CurrentDirectory ^& "\RefChecker.lnk"^)
+            echo shortcut.TargetPath = ws.CurrentDirectory ^& "\RefChecker.bat"
             echo shortcut.WorkingDirectory = ws.CurrentDirectory
             echo shortcut.IconLocation = ws.CurrentDirectory ^& "\%ICO_FILE%"
-            echo shortcut.Description = "Launch Citation Unified"
+            echo shortcut.Description = "Launch RefChecker"
             echo shortcut.WindowStyle = 7
             echo shortcut.Save
         )
         cscript //nologo create_shortcut.vbs
         del create_shortcut.vbs
-        IF EXIST "Citation Unified.lnk" (
-            ECHO     - Shortcut created: Citation Unified.lnk
+        IF EXIST "RefChecker.lnk" (
+            ECHO     - Shortcut created: RefChecker.lnk
         )
     ) ELSE (
         ECHO     - [INFO] Pillow not available. Skipping icon conversion.
@@ -108,9 +108,9 @@ ECHO.
 ECHO ========================================================
 ECHO  Setup Finished Successfully.
 ECHO  To start the program:
-ECHO    - Double-click 'CitationUnified.bat'
-IF EXIST "Citation Unified.lnk" (
-ECHO    - Or double-click 'Citation Unified' shortcut (has icon^)
+ECHO    - Double-click 'RefChecker.bat'
+IF EXIST "RefChecker.lnk" (
+ECHO    - Or double-click 'RefChecker' shortcut (has icon^)
 )
 ECHO ========================================================
 PAUSE

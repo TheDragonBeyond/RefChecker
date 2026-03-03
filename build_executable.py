@@ -5,9 +5,9 @@ import shutil
 import glob
 
 # --- Configuration ---
-APP_NAME = "CitationUnified"
+APP_NAME = "RefChecker"
 ENTRY_POINT = "app.py"
-ICON_SOURCE = "Citation_validation_icon.png"
+ICON_SOURCE = "RefChecker_icon.png"
 
 # Clean up previous builds
 if os.path.exists("dist"):
