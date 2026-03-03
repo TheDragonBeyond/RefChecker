@@ -1,0 +1,1981 @@
+Plugin Contract & Installation Guide
+======================================
+
+This document defines everything needed to design, build, install, and
+operate Extractor and Validator plugins.  It covers contracts, runtime
+patterns, scoring mechanics, shared utilities, rate limiting, and
+complete working examples derived from the production codebase.
+
+
+================================================================================
+TABLE OF CONTENTS
+================================================================================
+
+  1. Overview & Architecture
+  2. The Extractor Contract
+     2a. Installation Requirements
+     2b. Runtime Contract
+     2c. File Type Handling
+     2d. CSV Output Format
+     2e. Imports & Dependencies
+     2f. Complete Extractor Template
+  3. The Validator Contract
+     3a. Installation Requirements
+     3b. Tier 1 (API) vs Tier 2 (Deep Research) Architecture
+     3c. Return Types: MatchCandidate vs ValidationResult
+     3d. The Search Cascade Pattern
+     3e. Local Candidate Filtering (vs Pipeline Scoring)
+     3f. Rate Limiting Patterns
+     3g. Complete Tier 1 Validator Template
+     3h. Complete Tier 2 Validator Template
+  4. Shared Utilities Reference
+     4a. CitationAccessor — Full API
+     4b. check_author_overlap()
+     4c. years_match()
+     4d. normalize_for_api() vs normalize_title()
+     4e. compute_title_score()
+     4f. calculate_title_similarity()
+     4g. FileHandler — File Reading Utility
+  5. Scoring Pipeline
+     5a. How MatchCandidates Become ValidationResults
+     5b. Weighted Average Model
+     5c. Title Gate
+     5d. DOI/ID Cross-Check
+     5e. Author Anti-Overlap Penalty
+     5f. Status Vocabulary & Thresholds
+     5g. ScoringPipeline Constants Available to Validators
+  6. Artifact Schemas
+     6a. CSV Headers (Extractor Output)
+     6b. MatchCandidate Fields (Complete Constructor Reference)
+     6c. ValidationResult Fields
+  7. Configuration System
+     7a. Plugin Configuration (self.config)
+     7b. Application-Level Configuration (the config module)
+  8. Plugin Discovery & Manager Internals
+  9. Installation Instructions
+  10. Common Pitfalls
+
+
+================================================================================
+1. OVERVIEW & ARCHITECTURE
+================================================================================
+
+The system has two plugin types:
+
+  Extractors:
+    Ingest a file path → return a CSV string of parsed citations.
+    Discovered by ExtractionManager via BaseExtractor.__subclasses__().
+    One extractor runs per job (selected by the user in config).
+
+  Validators:
+    Accept a single citation row (dict) → return match signals or a verdict.
+    Discovered by ValidatorManager via BaseValidator.__subclasses__().
+    Multiple validators run per citation, orchestrated by the manager:
+      1. Tier 1 (API) validators run first, in parallel or sequence.
+      2. If no Tier 1 validator reaches the satisfaction threshold,
+         Tier 2 (Deep Research) validators are invoked as fallback.
+      3. The best result across all validators becomes the final verdict.
+
+Data flow:
+
+    [Source File]
+        → Extractor.extract(filepath) → CSV string (Artifact 1)
+        → CSV rows parsed into dicts
+        → Each dict → ValidatorManager.validate_citation(dict)
+            → Tier 1 validators return MatchCandidate or ValidationResult
+            → MatchCandidates routed through ScoringPipeline.score()
+            → Best result selected → ValidationResult (Artifact 2)
+        → ReportGenerator → Markdown/CSV/BibTeX/RIS report
+
+Key imports used across all plugins:
+
+    from extraction_plugins.base import BaseExtractor
+    from extraction_plugins.manager import register_extractor
+
+    from validators_plugin.base import BaseValidator, ValidationResult, deep_research_validator
+    from validators_plugin.manager import register_validator
+    from scoring import MatchCandidate, ScoringPipeline
+
+    from utils import (
+        CitationAccessor,
+        check_author_overlap,
+        years_match,
+        normalize_for_api,
+        normalize_title,
+        calculate_title_similarity,
+        compute_title_score,
+    )
+    from config import Config  # For Config.CSV_HEADERS
+
+Error isolation — important difference between plugin types:
+
+  Validators: The ValidatorManager wraps every validate() call in a
+  try/except.  If your validator raises an unhandled exception, it is
+  caught by the manager, which produces an error ValidationResult and
+  moves on.  Other validators continue to work normally.  Your plugin
+  won't crash the pipeline.
+
+  Extractors: The ExtractionManager does NOT catch exceptions from
+  extract().  If your extractor raises, the exception propagates up
+  to the extraction runner, which catches it at the top level and
+  aborts the job.  This is why the extract() contract says "return
+  empty string on failure (do not raise)" — catch your own exceptions
+  and return "" so the user gets a clean failure message rather than
+  a traceback.
+
+
+================================================================================
+2. THE EXTRACTOR CONTRACT
+================================================================================
+
+
+2a. INSTALLATION REQUIREMENTS
+-----------------------------
+
+For the Plugin Installer (File > Install Plugin...) to accept an extractor:
+
+  1. The file MUST contain a class that inherits from BaseExtractor.
+  2. The class MUST have the @register_extractor decorator.
+  3. Both are verified via AST analysis (the file is NOT imported).
+
+The @register_extractor decorator is a no-op at runtime (it returns the
+class unchanged).  It exists solely to satisfy the installer's AST check.
+At runtime, discovery uses BaseExtractor.__subclasses__(), so inheritance
+alone is sufficient.  But ALWAYS include the decorator for installer
+compatibility.
+
+Optional: Declare a DEPENDENCIES class-level list of pip package strings.
+The installer reads this via AST and runs `pip install` before copying
+the file.  Omit or set to [] if you have no external dependencies.
+
+
+2b. RUNTIME CONTRACT
+--------------------
+
+Your extractor class must implement:
+
+  REQUIRED:
+    name (property) → str
+        Display name shown in UI, logs, and config selection.
+        Must be unique across all extractors.
+
+    extract(filepath: str) → str
+        Input:  Absolute path to the source file.
+        Output: A valid CSV string with headers matching Config.CSV_HEADERS.
+                Return an empty string "" on failure (do not raise).
+        This is the main entry point.  All file reading, parsing, API
+        calls, and CSV formatting happen here.
+
+        IMPORTANT: Unlike validators, the ExtractionManager does NOT
+        wrap extract() in try/except.  If your extractor raises an
+        unhandled exception, it propagates to the extraction runner and
+        aborts the job.  Always catch exceptions internally and return
+        "" on failure.
+
+    get_default_settings() → Dict[str, Any]
+        Return a dict of default configuration values.  These become
+        self.config on first instantiation.  A JSON file is auto-created.
+
+  OPTIONAL:
+    is_programmatic (property) → bool
+        Default: False (LLM-based).
+        Override to True for regex/parsing extractors.
+        The ExtractionManager prioritizes programmatic extractors.
+
+    is_configured() → bool
+        Default: False.
+        Return True when the plugin has everything it needs to operate
+        (valid credentials, reachable endpoints, required files, etc.).
+
+        Returning False does NOT prevent the plugin from running — the
+        manager will still call it if it is enabled.  However, the
+        application will flag the plugin in the UI and actively direct
+        the user to its settings page to correct the configuration.
+        Think of it as the plugin's way of saying "I'm not ready,
+        please prompt the user."
+
+        The default is False, so plugins that require configuration
+        (API keys, endpoints, etc.) will prompt the user automatically
+        on first use until this method is properly overridden.
+
+        For programmatic plugins that have no configuration requirements
+        (like the Wikipedia HTML parser), override to always return True:
+
+            def is_configured(self) -> bool:
+                return True  # No configuration needed
+
+        For API-based plugins, check for valid credentials:
+
+            def is_configured(self) -> bool:
+                api_key = self.config.get("API_KEY")
+                return bool(api_key and api_key != "YOUR_KEY_HERE")
+
+        is_configured() should only return False if the plugin actually
+        needs the user to configure something.
+
+    DEPENDENCIES: List[str] = []
+        Class-level list of pip packages for automatic installation.
+
+
+2c. FILE TYPE HANDLING
+----------------------
+
+Your extract() method receives a file path.  You are responsible for
+detecting the file type and reading it appropriately.  Common patterns
+from the production extractors:
+
+  PDF files:
+    - Use pypdf to extract text:
+        reader = pypdf.PdfReader(filepath)
+        text = "\n".join(page.extract_text() or "" for page in reader.pages)
+    - Or upload to an API (Gemini, GROBID) that accepts PDFs natively.
+
+  Text files (.txt, .html, .md, .csv, .xml, .json, .rtf):
+    - Use FileHandler.read_text_file(filepath) from file_handler module.
+      See Section 4g for FileHandler details.
+    - Or read directly:
+        with open(filepath, 'r', encoding='utf-8') as f:
+            content = f.read()
+
+  Detecting file type:
+    import os
+    file_ext = os.path.splitext(filepath)[1].lower()
+
+  Model selection by file type (Gemini pattern):
+    The Gemini extractor uses a faster model for PDFs and a more capable
+    model for messy text/HTML.  This is a good pattern to follow:
+
+    if file_ext == '.pdf':
+        model = self.config["MODEL_NAME"]       # e.g. gemini-2.5-flash
+    elif file_ext in {'.html', '.htm', '.txt', '.md'}:
+        model = self.config["MODEL_NAME_TEXT"]   # e.g. gemini-2.5-pro
+
+  Wikipedia HTML (programmatic pattern):
+    The WikipediaExtractor parses <ol class="references"> lists using
+    BeautifulSoup, extracts COinS metadata from <span class="Z3988">,
+    and merges data from multiple parsing strategies per reference.
+    This is the most complex programmatic extractor.
+
+
+2d. CSV OUTPUT FORMAT
+---------------------
+
+Your extract() method must return a CSV string whose columns match
+Config.CSV_HEADERS exactly.  Import headers like this:
+
+    from config import Config
+    headers = Config.CSV_HEADERS
+
+The 22 required columns (in order):
+
+    "Citation Number", "Type", "Authors", "Article Title",
+    "Publication Title", "Series", "Editor", "Volume", "Issue",
+    "Publisher", "Publication Location", "Year", "Month", "Day",
+    "Pages", "Edition", "Institution", "DOI", "ISBN", "ISSN",
+    "URL", "Date Accessed"
+
+Rules:
+  - All fields must be double-quoted in the CSV output.
+  - Leave empty string "" for missing fields (not None, not null).
+  - Authors must be semicolon-separated: "Smith, J.; Doe, A."
+  - Type must be one of:
+      "Journal Article", "Conference Paper", "Book", "Book Chapter",
+      "Thesis", "Report", "Website", "Magazine Article",
+      "Newspaper Article", "Encyclopedia Entry", "Other"
+  - Citation Number should be sequential integers starting from 1.
+
+Producing CSV output — two approaches:
+
+  Approach 1: Python csv module (recommended for programmatic extractors)
+    import csv
+    from io import StringIO
+
+    buf = StringIO()
+    writer = csv.writer(buf, quoting=csv.QUOTE_ALL, lineterminator='\n')
+    writer.writerow(Config.CSV_HEADERS)
+    for citation in citations:
+        row = [citation.get(h, "") for h in Config.CSV_HEADERS]
+        writer.writerow(row)
+    return buf.getvalue()
+
+  Approach 2: LLM-generated CSV (for LLM extractors)
+    Instruct the LLM to output CSV directly with the exact headers.
+    Strip markdown code fences from the response:
+        import re
+        s = re.sub(r"^```[a-zA-Z0-9_-]*\s*", "", s)
+        s = re.sub(r"\s*```\s*$", "", s)
+
+  Approach 3: JSON → CSV conversion (Gemini pattern)
+    Use Gemini's structured output (response_mime_type="application/json"
+    with a response_schema) to get JSON, then convert to CSV.  This is
+    more reliable than asking an LLM to produce CSV directly.
+
+
+2e. IMPORTS & DEPENDENCIES
+--------------------------
+
+Standard imports available without DEPENDENCIES:
+
+    import os, re, csv, json, io, time, traceback, mimetypes
+    from typing import Dict, Any, List
+    from extraction_plugins.base import BaseExtractor
+    from extraction_plugins.manager import register_extractor
+    from config import Config          # For Config.CSV_HEADERS
+    from file_handler import FileHandler  # For FileHandler.read_text_file()
+
+NOTE ON THE config MODULE:
+    The project has two config-related imports that serve different
+    purposes:
+
+        from config import Config      # Class with CSV_HEADERS, etc.
+        import config                  # Module with runtime globals
+
+    ``Config`` (capital C) is a class containing CSV headers and output
+    settings.  This is what extractors typically need.
+
+    ``config`` (lowercase, the module itself) exposes bare global
+    variables used by the managers at runtime.  See Section 7b for
+    the full list.
+
+    Plugin authors generally only need ``Config.CSV_HEADERS``.  The
+    module-level globals are consumed by the managers, not by plugins
+    directly.
+
+Common optional dependencies (declare in DEPENDENCIES):
+
+    "openai"        — OpenAI API client
+    "google-genai"  — Google Gemini API client
+    "pypdf"         — PDF text extraction
+    "requests"      — HTTP requests (already available in most installs)
+    "beautifulsoup4" — HTML parsing (often listed as "bs4")
+    "python-dateutil" — Robust date parsing
+
+
+2f. COMPLETE EXTRACTOR TEMPLATE
+-------------------------------
+
+This template shows a fully functional LLM-based extractor with proper
+file type handling, error recovery, and CSV output.
+
+    # extraction_plugins/my_extractor.py
+
+    import os
+    import re
+    from typing import Dict, Any, List
+    from extraction_plugins.base import BaseExtractor
+    from extraction_plugins.manager import register_extractor
+    from config import Config
+
+    @register_extractor
+    class MyExtractor(BaseExtractor):
+        """
+        Example extractor using a hypothetical API.
+        """
+        DEPENDENCIES: List[str] = ["requests"]
+
+        @property
+        def name(self) -> str:
+            return "My Custom Extractor"
+
+        @property
+        def is_programmatic(self) -> bool:
+            # True for regex/parsing, False for LLM-based
+            return False
+
+        def is_configured(self) -> bool:
+            api_key = self.config.get("API_KEY")
+            return bool(api_key and api_key != "YOUR_KEY_HERE")
+
+        def get_default_settings(self) -> Dict[str, Any]:
+            return {
+                "API_KEY": "YOUR_KEY_HERE",
+                "MODEL_NAME": "my-model-v2",
+                "TIMEOUT": 60,
+                "MAX_TOKENS": 25000,
+            }
+
+        def extract(self, filepath: str) -> str:
+            """
+            Main extraction entry point.
+
+            1. Detect file type and read content.
+            2. Send to API/LLM for citation extraction.
+            3. Parse response into CSV format.
+            4. Return CSV string or "" on failure.
+
+            IMPORTANT: Always catch exceptions and return "" — the
+            ExtractionManager does NOT wrap extract() in try/except.
+            """
+            # --- Step 1: Read file content ---
+            try:
+                file_ext = os.path.splitext(filepath)[1].lower()
+
+                if file_ext == '.pdf':
+                    content = self._read_pdf(filepath)
+                elif file_ext in {'.html', '.htm', '.txt', '.md', '.xml'}:
+                    with open(filepath, 'r', encoding='utf-8', errors='ignore') as f:
+                        content = f.read()
+                else:
+                    # Fallback: try reading as text
+                    with open(filepath, 'r', encoding='utf-8', errors='ignore') as f:
+                        content = f.read()
+
+            except Exception as e:
+                print(f"[{self.name}] Failed to read file: {e}")
+                return ""
+
+            if not content.strip():
+                print(f"[{self.name}] File is empty or unreadable.")
+                return ""
+
+            print(f"[{self.name}] Read {len(content)} characters from {file_ext} file.")
+
+            # --- Step 2: Call your API/LLM ---
+            try:
+                raw_response = self._call_api(content)
+            except Exception as e:
+                print(f"[{self.name}] API call failed: {e}")
+                return ""
+
+            # --- Step 3: Parse response into CSV ---
+            csv_output = self._parse_to_csv(raw_response)
+            return csv_output
+
+        def _read_pdf(self, filepath: str) -> str:
+            """Extract text from PDF.  Requires pypdf in DEPENDENCIES."""
+            try:
+                import pypdf
+            except ImportError:
+                raise ImportError("pypdf is required for PDF extraction")
+
+            reader = pypdf.PdfReader(filepath)
+            pages = []
+            for page in reader.pages:
+                text = page.extract_text()
+                if text:
+                    pages.append(text)
+            return "\n".join(pages)
+
+        def _call_api(self, document_text: str) -> str:
+            """
+            Send document text to your extraction API.
+            Replace this with your actual API logic.
+            """
+            import requests
+
+            api_key = self.config["API_KEY"]
+            # ... your API call here ...
+            # Return the raw response text
+            return ""
+
+        def _parse_to_csv(self, raw_response: str) -> str:
+            """
+            Convert API response to CSV matching Config.CSV_HEADERS.
+
+            If your API returns JSON, parse it here.
+            If your API returns CSV directly, clean it here.
+            """
+            import csv
+            from io import StringIO
+
+            headers = Config.CSV_HEADERS
+
+            # Example: if raw_response is JSON array of citation dicts
+            import json
+            try:
+                records = json.loads(raw_response)
+            except json.JSONDecodeError:
+                print(f"[{self.name}] Failed to parse API response as JSON.")
+                return ""
+
+            buf = StringIO()
+            writer = csv.writer(buf, quoting=csv.QUOTE_ALL, lineterminator='\n')
+            writer.writerow(headers)
+
+            for rec in records:
+                row = [str(rec.get(h, "")) for h in headers]
+                writer.writerow(row)
+
+            return buf.getvalue()
+
+
+================================================================================
+3. THE VALIDATOR CONTRACT
+================================================================================
+
+
+3a. INSTALLATION REQUIREMENTS
+-----------------------------
+
+The installer's AST check requires:
+
+  1. Class inherits from BaseValidator.
+  2. Class has @register_validator decorator.
+  3. Optionally: @deep_research_validator decorator for Tier 2.
+  4. Optionally: DEPENDENCIES class-level list.
+
+IMPORTANT FOR TIER 2: The installer's AST check requires
+@register_validator even for Tier 2 validators.  Having only
+@deep_research_validator is NOT sufficient — the installer will reject
+the file.  At runtime, __subclasses__() discovery would still find
+the class, so a manually dropped-in file would work without
+@register_validator.  But for installer compatibility, ALWAYS include
+both decorators for Tier 2:
+
+    @register_validator
+    @deep_research_validator
+    class MyResearchValidator(BaseValidator):
+        ...
+
+At runtime, BaseValidator.__subclasses__() discovers all validators.
+
+
+3b. TIER 1 (API) vs TIER 2 (DEEP RESEARCH) ARCHITECTURE
+---------------------------------------------------------
+
+Tier 1 — Primary API validators:
+  - Use @register_validator only (no @deep_research_validator).
+  - Fast API lookups: Crossref, DBLP, Google Books, PubMed, Open Library, ArXiv.
+  - SHOULD return MatchCandidate with raw signals for centralized scoring.
+  - The ValidatorManager runs ALL enabled Tier 1 validators and picks the best.
+  - Stops early if cfg.SATISFIED_THRESHOLD confirmations are reached.
+
+Tier 2 — Deep Research validators:
+  - Use BOTH @register_validator AND @deep_research_validator.
+  - Slower, expensive checks: LLM analysis, Google Custom Search scraping.
+  - Only invoked if NO Tier 1 validator produced a score above
+    cfg.LLM_CONFIDENCE_THRESHOLD.
+  - MAY return ValidationResult directly (LLM validators produce their
+    own holistic assessment with reasoning).
+
+The ValidatorManager dispatches transparently via _resolve_result():
+    if isinstance(raw, MatchCandidate) → ScoringPipeline.score(raw)
+    if isinstance(raw, ValidationResult) → pass through as-is
+
+
+3c. RETURN TYPES: MatchCandidate vs ValidationResult
+-----------------------------------------------------
+
+When to return MatchCandidate:
+  - Your validator found a candidate match from an API.
+  - You can report raw signals: matched title, author overlap, year match.
+  - The ScoringPipeline converts these into a ValidationResult with
+    consistent scoring across all validators.
+  - This is the PREFERRED return type for Tier 1 validators.
+
+When to return ValidationResult directly:
+  - Errors: API failures, missing libraries, bad credentials.
+  - Not found: No results from the API at all.
+  - Skips: No title/identifier provided, can't search.
+  - LLM validators: They produce their own confidence and reasoning.
+
+IMPORTANT: A single validate() call returns ONE result — either the best
+candidate you found, or a ValidationResult explaining why you couldn't
+find anything.  You do NOT return multiple candidates.  Your validate()
+method is responsible for evaluating all API results and picking the best
+one before returning.
+
+
+3d. THE SEARCH CASCADE PATTERN
+------------------------------
+
+Every production validator follows a multi-strategy cascade.  This is
+the MOST IMPORTANT runtime pattern and is not optional for a good
+validator.  The principle: try the most specific identifier first,
+then fall back to progressively looser searches.
+
+Standard cascade structure:
+
+    def validate(self, citation_data):
+        acc = CitationAccessor(citation_data)
+
+        # Strategy A: Direct identifier lookup (if available)
+        #   DOI, PMID, ArXiv ID, ISBN — these are authoritative.
+        #   If found, return MatchCandidate(direct_id_verified=True)
+        #   which gives an automatic score of 100 (Validated).
+
+        identifier = acc.doi  # or acc.pmid, acc.arxiv_id, acc.isbn
+        if identifier:
+            result = self._lookup_by_id(identifier, acc)
+            if result is not None:
+                return result
+            # ID not found — fall through to title search.
+
+        # Strategy B: Targeted title + author search
+        #   Use the API's field-restricted search if available.
+        #   e.g. Crossref query_bibliographic, PubMed [Title]+[Author],
+        #   Google Books intitle:+inauthor:, DBLP title+author query.
+
+        if not acc.title:
+            return ValidationResult(self.name, "Not Validated", 0,
+                "No identifier or title provided")
+
+        result = self._search_title_and_author(acc)
+        if isinstance(result, MatchCandidate):
+            return result
+
+        # Strategy C: Title-only fallback (if Strategy B found nothing)
+        #   Drop the author constraint to catch cases where the API
+        #   stores author names differently than the citation.
+
+        return self._search_title_only(acc)
+
+Production examples:
+
+  Crossref:   DOI lookup → bibliographic search (title + first author)
+  PubMed:     PMID → title[Title]+author[Author] → title[Title] → loose keywords
+  ArXiv:      ArXiv ID (from field or DOI) → ti:"title" search
+  Google Books: ISBN → intitle:+inauthor: → intitle: only
+  Open Library: title+author → (implicit title-only via fewer params)
+  DBLP:       title+author query → (single strategy, but robust parsing)
+
+
+3e. LOCAL CANDIDATE FILTERING (vs PIPELINE SCORING)
+----------------------------------------------------
+
+CRITICAL DISTINCTION: The documentation's instruction to "NOT compute
+final scores" means validators should not determine the final status
+(Validated/Possible Match/Not Validated) or the display score (0-100).
+That is the ScoringPipeline's job.
+
+However, validators MUST compute local title similarity for two purposes:
+
+  1. Filtering: Skip obviously wrong results before building a MatchCandidate.
+     Use ScoringPipeline.TITLE_GATE (value: 0.30, but always reference
+     the constant) as your minimum cutoff:
+
+        from scoring import ScoringPipeline
+
+        sim = calculate_title_similarity(acc.title, api_title)
+        if sim < ScoringPipeline.TITLE_GATE:
+            continue  # Skip this result
+
+  2. Best-candidate selection: When the API returns multiple results,
+     pick the one with the highest title similarity, using author overlap
+     count as tiebreaker:
+
+        is_better = (
+            sim > best_sim
+            or (sim == best_sim
+                and author_count > getattr(best_candidate, 'author_overlap_count', 0))
+        )
+
+For local filtering, use calculate_title_similarity() (single-metric,
+fast).  The pipeline uses compute_title_score() (multi-metric with
+distinctive-token penalty) for final scoring — but that's the pipeline's
+job, not yours.
+
+You CAN also pass title_similarity on the MatchCandidate (several
+production validators do).  This is currently stored but the pipeline
+recomputes its own score from the raw titles.  Passing it is harmless
+and useful for debugging.
+
+Performance optimization (Crossref pattern):
+    For very high-volume APIs, you can use raw fuzz.token_sort_ratio
+    as a cheap pre-filter BEFORE calculate_title_similarity():
+
+        from rapidfuzz import fuzz
+        quick_sim = fuzz.token_sort_ratio(acc.title, item_title)  # 0-100
+        if quick_sim < 30:
+            continue
+
+
+3f. RATE LIMITING PATTERNS
+--------------------------
+
+Every real API enforces rate limits.  Your validator MUST implement
+rate limiting or it will be banned/throttled.  Here are the patterns
+used in production:
+
+Pattern 1: Simple pre-request delay (DBLP, Open Library)
+    Store a REQUEST_DELAY config key and sleep before each request:
+
+        time.sleep(self.config["REQUEST_DELAY"])
+        response = requests.get(url, params=params, timeout=self.config["TIMEOUT"])
+
+Pattern 2: Monotonic clock throttling (Google Books)
+    Track last request time and sleep only if needed:
+
+        def _throttle(self):
+            delay = self.config.get("REQUEST_DELAY", 1.0)
+            elapsed = time.monotonic() - self._last_request_time
+            remaining = delay - elapsed
+            if remaining > 0:
+                time.sleep(remaining)
+
+Pattern 3: Library-managed delay (ArXiv)
+    The arxiv library's Client has built-in delay_seconds:
+
+        self.client = arxiv.Client(
+            delay_seconds=self.config.get("DELAY_SECONDS", 3.0),
+            num_retries=self.config.get("NUM_RETRIES", 1),
+        )
+
+    Reuse the same client instance across validate() calls.
+
+Pattern 4: BioPython-managed (PubMed)
+    BioPython's Entrez module handles NCBI rate limiting internally.
+    Add a small inter-call delay between your own sequential calls:
+
+        time.sleep(self.config.get("REQUEST_DELAY", 0.35))
+
+429 Retry Pattern (used by DBLP, Open Library, Google Books):
+
+    def _request_with_retry(self, url, params):
+        max_retries = self.config["MAX_RETRIES"]
+        for attempt in range(max_retries + 1):
+            response = requests.get(url, params=params, timeout=self.config["TIMEOUT"])
+            if response.status_code != 429:
+                return response
+            if attempt < max_retries:
+                retry_after = response.headers.get('Retry-After')
+                wait = float(retry_after) if retry_after else self.config["RETRY_BACKOFF"]
+                print(f"[{self.name}] Rate limited (429). Waiting {wait}s...")
+                time.sleep(wait)
+        return response  # Return the 429 so caller can handle it
+
+User-Agent header (Open Library, Google Books):
+    Some APIs require or benefit from identifying your application:
+
+        self._session = requests.Session()
+        self._session.headers.update({
+            "User-Agent": "CitationValidator/1.0 (email@example.com)",
+        })
+
+Typical rate limit settings to include in get_default_settings():
+
+    {
+        "REQUEST_DELAY": 1.0,    # seconds between requests
+        "MAX_RETRIES": 2,        # retry attempts on 429
+        "RETRY_BACKOFF": 5.0,    # default wait if no Retry-After header
+        "TIMEOUT": 10,           # HTTP request timeout in seconds
+    }
+
+
+3g. COMPLETE TIER 1 VALIDATOR TEMPLATE
+--------------------------------------
+
+This template demonstrates a fully functional API-based validator with
+all production patterns: CitationAccessor, search cascade, local
+filtering, rate limiting, and MatchCandidate construction.
+
+CRITICAL — MATCHCANDIDATE FIELD REQUIREMENTS:
+    Every MatchCandidate you return MUST populate these fields for the
+    scoring pipeline to work correctly.  See Section 10 (Common Pitfalls)
+    for what goes wrong when these are omitted.
+
+    For ALL MatchCandidates (title-search and DOI/ID-lookup):
+      - citation_title        — from acc.title.  The pipeline computes
+                                title similarity from this.  If empty,
+                                the score is always 0.
+      - citation_author_count — from acc.author_count.  The pipeline
+                                uses this for the author score and
+                                anti-overlap penalty.
+
+    Additionally for DOI/ID-verified matches:
+      - resolved_title        — the title the API returned for the
+                                resolved identifier.  The pipeline
+                                cross-checks this against citation_title.
+
+    # validators_plugin/my_api_validator.py
+
+    import time
+    import re
+    import requests
+    from typing import Dict, Any, List, Optional, Union
+
+    from validators_plugin.base import BaseValidator, ValidationResult
+    from validators_plugin.manager import register_validator
+    from scoring import MatchCandidate, ScoringPipeline
+
+    from utils import (
+        CitationAccessor,
+        normalize_for_api,
+        calculate_title_similarity,
+        check_author_overlap,
+        years_match,
+    )
+
+    @register_validator
+    class MyApiValidator(BaseValidator):
+        """
+        Tier 1 validator using the hypothetical MySource API.
+        """
+        DEPENDENCIES: List[str] = ["requests"]
+
+        @property
+        def name(self) -> str:
+            return "MySource API"
+
+        def get_default_settings(self) -> Dict[str, Any]:
+            return {
+                "API_KEY": "YOUR_KEY_HERE",
+                "BASE_URL": "https://api.mysource.com/v1",
+                "MAX_RESULTS": 5,
+                "TIMEOUT": 10,
+                "REQUEST_DELAY": 1.0,
+                "MAX_RETRIES": 2,
+                "RETRY_BACKOFF": 5.0,
+                "YEAR_MATCH_TOLERANCE": 1,
+            }
+
+        def is_configured(self) -> bool:
+            api_key = self.config.get("API_KEY")
+            return bool(api_key and api_key != "YOUR_KEY_HERE")
+
+        def __init__(self):
+            super().__init__()
+            self._session = requests.Session()
+            self._last_request_time: float = 0.0
+
+        # ==============================================================
+        # Main entry point
+        # ==============================================================
+
+        def validate(self, citation_data: Dict[str, str]) -> Union[MatchCandidate, ValidationResult]:
+            acc = CitationAccessor(citation_data)
+
+            # ── Strategy A: Direct DOI lookup ──────────────────────
+            doi = acc.doi
+            if doi:
+                result = self._lookup_by_doi(doi, acc)
+                if result is not None:
+                    return result
+                # DOI not found — fall through to title search.
+
+            # ── Need a title to proceed ────────────────────────────
+            if not acc.title:
+                return ValidationResult(
+                    source_name=self.name,
+                    status="Not Validated",
+                    confidence_score=0,
+                    details="No DOI or title provided for search"
+                )
+
+            # ── Strategy B: Title + author search ──────────────────
+            try:
+                return self._search_by_title(acc)
+            except Exception as e:
+                return ValidationResult(
+                    source_name=self.name,
+                    status="Validation Error",
+                    confidence_score=0,
+                    details=f"API error: {str(e)}"
+                )
+
+        # ==============================================================
+        # Strategy A: DOI lookup → MatchCandidate(doi_verified=True)
+        # ==============================================================
+
+        def _lookup_by_doi(self, doi: str, acc: CitationAccessor
+                          ) -> Optional[Union[MatchCandidate, ValidationResult]]:
+            """
+            Returns MatchCandidate if DOI resolves, None if not found,
+            ValidationResult on error.
+            """
+            data = self._api_get(f"/works/{doi}")
+            if data is None:
+                return None  # Not found — caller falls through
+
+            title = data.get("title", "")
+            return MatchCandidate(
+                source_name=self.name,
+                doi_verified=True,
+                citation_title=acc.title,       # REQUIRED — cross-check uses this
+                matched_title=title,
+                resolved_title=title,           # REQUIRED when doi_verified=True
+                citation_author_count=acc.author_count,  # REQUIRED for penalty calc
+                evidence_links=[f"https://doi.org/{doi}"],
+                raw_metadata=data,
+                match_details=f"DOI Exact Match: '{title}'\n  DOI: {doi}",
+            )
+
+        # ==============================================================
+        # Strategy B: Title search → best MatchCandidate
+        # ==============================================================
+
+        def _search_by_title(self, acc: CitationAccessor
+                            ) -> Union[MatchCandidate, ValidationResult]:
+            """
+            Search by title (+ optional author), evaluate each result,
+            return the best MatchCandidate or a not-found ValidationResult.
+            """
+            query = normalize_for_api(acc.title)
+            if acc.first_author_surname:
+                query += " " + normalize_for_api(acc.first_author_surname)
+
+            data = self._api_get("/search", params={"q": query, "limit": self.config["MAX_RESULTS"]})
+            if not data or not data.get("results"):
+                return ValidationResult(
+                    source_name=self.name,
+                    status="Not Validated",
+                    confidence_score=0,
+                    details="No results found"
+                )
+
+            items = data["results"]
+            best_candidate: Optional[MatchCandidate] = None
+            best_sim: float = -1.0
+
+            for rank, item in enumerate(items, 1):
+                item_title = item.get("title", "")
+
+                # ── Local filtering ────────────────────────────────
+                sim = calculate_title_similarity(acc.title, item_title)
+                if sim < ScoringPipeline.TITLE_GATE:
+                    continue  # Below pipeline's title gate — skip
+
+                # ── Author overlap ─────────────────────────────────
+                # Determine author_format based on your API's response:
+                #   "structured" — list of dicts with 'family' key (Crossref)
+                #   "names"      — list of plain name strings (most APIs)
+                api_authors = item.get("authors", [])
+                author_matched = False
+                author_count = 0
+                if acc.authors and api_authors:
+                    author_matched, author_count = check_author_overlap(
+                        acc.authors, api_authors,
+                        author_format="names"  # or "structured" for Crossref-style
+                    )
+
+                # ── Year match ─────────────────────────────────────
+                api_year = item.get("year", "")
+                year_matched = years_match(
+                    acc.year, api_year,
+                    tolerance=self.config["YEAR_MATCH_TOLERANCE"]
+                )
+
+                # ── Best-candidate selection ───────────────────────
+                is_better = (
+                    sim > best_sim
+                    or (sim == best_sim
+                        and author_count > getattr(best_candidate, 'author_overlap_count', 0))
+                )
+
+                if is_better:
+                    best_sim = sim
+                    evidence = [item.get("url", "")]
+                    if item.get("doi"):
+                        evidence.append(f"https://doi.org/{item['doi']}")
+
+                    best_candidate = MatchCandidate(
+                        source_name=self.name,
+                        citation_title=acc.title,          # REQUIRED — pipeline computes
+                                                           # title score from this
+                        matched_title=item_title,
+                        matched_authors=api_authors,
+                        matched_year=str(api_year),
+                        author_overlap_matched=author_matched,
+                        author_overlap_count=author_count,
+                        citation_author_count=acc.author_count,  # REQUIRED for author
+                                                                 # score & penalty
+                        year_matched=year_matched,
+                        result_rank=rank,
+                        evidence_links=[e for e in evidence if e],
+                        raw_metadata=item,
+                        match_details=f"Found match (rank #{rank}): '{item_title}'",
+                    )
+
+            if best_candidate:
+                return best_candidate
+
+            top_title = items[0].get("title", "N/A") if items else "N/A"
+            return ValidationResult(
+                source_name=self.name,
+                status="Not Validated",
+                confidence_score=0,
+                details=f"No sufficiently similar match. Top result: '{top_title}'"
+            )
+
+        # ==============================================================
+        # HTTP layer with rate limiting and retry
+        # ==============================================================
+
+        def _api_get(self, endpoint: str, params: Dict = None):
+            """Rate-limited GET with 429 retry.  Returns parsed JSON or None."""
+            self._throttle()
+            url = self.config["BASE_URL"].rstrip("/") + endpoint
+
+            full_params = params or {}
+            api_key = self.config.get("API_KEY", "")
+            if api_key:
+                full_params["apikey"] = api_key
+
+            max_retries = self.config.get("MAX_RETRIES", 2)
+            for attempt in range(max_retries + 1):
+                try:
+                    resp = self._session.get(
+                        url, params=full_params, timeout=self.config["TIMEOUT"]
+                    )
+                    self._last_request_time = time.monotonic()
+
+                    if resp.status_code == 200:
+                        return resp.json()
+                    elif resp.status_code == 404:
+                        return None  # Not found
+                    elif resp.status_code == 429:
+                        if attempt < max_retries:
+                            wait = float(resp.headers.get("Retry-After",
+                                         self.config["RETRY_BACKOFF"]))
+                            time.sleep(wait)
+                            continue
+                    else:
+                        print(f"[{self.name}] HTTP {resp.status_code}")
+                        return None
+                except requests.exceptions.Timeout:
+                    if attempt < max_retries:
+                        time.sleep(self.config["RETRY_BACKOFF"])
+                        continue
+                    return None
+                except Exception as e:
+                    print(f"[{self.name}] Request error: {e}")
+                    return None
+
+            return None
+
+        def _throttle(self):
+            delay = self.config.get("REQUEST_DELAY", 1.0)
+            elapsed = time.monotonic() - self._last_request_time
+            remaining = delay - elapsed
+            if remaining > 0:
+                time.sleep(remaining)
+
+
+3h. COMPLETE TIER 2 VALIDATOR TEMPLATE
+--------------------------------------
+
+Tier 2 validators return ValidationResult directly.  They are invoked
+only when Tier 1 fails.
+
+IMPORTANT: Tier 2 validators MUST have BOTH @register_validator AND
+@deep_research_validator decorators.  Missing @register_validator will
+cause the Plugin Installer to reject the file (see Section 3a).
+
+    # validators_plugin/my_llm_validator.py
+
+    import json
+    from typing import Dict, Any, List
+    from validators_plugin.base import (
+        BaseValidator, ValidationResult, deep_research_validator
+    )
+    from validators_plugin.manager import register_validator
+
+    @register_validator
+    @deep_research_validator
+    class MyLlmValidator(BaseValidator):
+        """
+        Tier 2 validator using an LLM for deep research.
+        Only invoked when Tier 1 validators fail.
+        """
+        DEPENDENCIES: List[str] = []
+
+        @property
+        def name(self) -> str:
+            return "My LLM Research Agent"
+
+        def get_default_settings(self) -> Dict[str, Any]:
+            return {
+                "API_KEY": "YOUR_KEY_HERE",
+                "MODEL_NAME": "gpt-5.2",
+                "TEMPERATURE": 0.0,
+                "TIMEOUT": 30,
+                "MAX_TOKENS": 2000,
+            }
+
+        def is_configured(self) -> bool:
+            api_key = self.config.get("API_KEY")
+            return bool(api_key and "YOUR" not in str(api_key))
+
+        def validate(self, citation_data: Dict[str, str]) -> ValidationResult:
+            """
+            LLM validators return ValidationResult directly because they
+            produce their own holistic assessment with reasoning.
+            """
+            api_key = self.config.get("API_KEY")
+            if not api_key or "YOUR" in str(api_key):
+                return ValidationResult(
+                    self.name, "Error", 0,
+                    "Missing API Key in config."
+                )
+
+            # 1. Build prompt from citation data
+            citation_str = "\n".join(f"- {k}: {v}" for k, v in citation_data.items() if v)
+            prompt = f"Verify this citation:\n{citation_str}\n..."
+
+            # 2. Call LLM API
+            try:
+                # ... your LLM call here ...
+                response_text = ""  # raw LLM response
+            except Exception as e:
+                return ValidationResult(self.name, "Error", 0, f"API error: {e}")
+
+            # 3. Parse LLM response
+            try:
+                parsed = json.loads(response_text)
+            except json.JSONDecodeError:
+                return ValidationResult(self.name, "Error", 0, "Failed to parse LLM response")
+
+            # 4. Map to ValidationResult
+            # Status vocabulary for LLM validators:
+            #   "Validated"      — high confidence the citation is real
+            #   "Possible Match" — partial evidence, needs review
+            #   "Not Validated"  — no credible match found
+            #   "Ambiguous"      — non-standard source (blog, repo, product page)
+            #   "Error"          — failures
+            status = parsed.get("recommendation", "Not Validated")
+            confidence = parsed.get("confidence", 0)
+
+            evidence_links = []
+            evidence = parsed.get("evidence", {})
+            if evidence.get("doi_url"):
+                evidence_links.append(evidence["doi_url"])
+            if evidence.get("google_scholar_link"):
+                evidence_links.append(evidence["google_scholar_link"])
+
+            return ValidationResult(
+                source_name=self.name,
+                status=status,
+                confidence_score=confidence,
+                details=f"Reasoning: {parsed.get('reasoning', 'N/A')}",
+                evidence_links=evidence_links,
+                metadata=parsed,
+            )
+
+
+================================================================================
+4. SHARED UTILITIES REFERENCE
+================================================================================
+
+
+4a. CitationAccessor — FULL API
+-------------------------------
+
+Wraps a citation_data dict for uniform, case-insensitive field access.
+Eliminates per-validator key-spelling boilerplate.
+
+    from utils import CitationAccessor
+    acc = CitationAccessor(citation_data)
+
+PROPERTIES (all return str, empty string if missing):
+
+  Core fields:
+    acc.title              — Article/work title ("Article Title" field)
+    acc.container_title    — Journal/book/proceedings title ("Publication Title")
+    acc.authors            — Raw semicolon-separated author string
+    acc.year               — Cleaned 4-digit year string (extracts from dates)
+    acc.doi                — Cleaned DOI (URL prefixes stripped, also checks URL field)
+    acc.citation_type      — Lowercased type string (e.g. "journal article")
+    acc.citation_number    — Citation number from the CSV
+
+  Derived fields:
+    acc.first_author_surname — Extracted surname of first author.
+                               Handles "Smith, J.", "J. Smith", "Smith et al."
+    acc.author_count       — int. Number of semicolon-separated authors.
+                             Use for MatchCandidate.citation_author_count.
+    acc.year_raw           — Unprocessed year/date string (before cleaning).
+
+  Title selection:
+    acc.best_title(prefer_container=False)
+        Returns the most useful title for searching.
+        prefer_container=False (default): article title, fallback to container.
+            Use for: Crossref, DBLP, PubMed, ArXiv, JSTOR.
+        prefer_container=True: container title, fallback to article.
+            Use for: Google Books, Open Library (book databases).
+
+        For book validators, a common pattern:
+            search_title = acc.best_title(prefer_container='book' in acc.citation_type)
+
+  Identifiers:
+    acc.isbn               — ISBN field value
+    acc.issn               — ISSN field value
+    acc.url                — URL field value
+    acc.pmid               — PubMed ID if present
+    acc.arxiv_id           — ArXiv ID (checks explicit field AND extracts from
+                             DOI strings like "10.48550/arXiv.2202.12345")
+
+  Other bibliographic fields:
+    acc.volume, acc.issue, acc.pages, acc.edition
+    acc.publisher, acc.institution, acc.editor, acc.series
+
+  Generic access:
+    acc.get("field_name")      — Case-insensitive, space/underscore agnostic.
+    acc.get("field_name", "default")
+    acc.has("field_name")      — True if non-empty value exists.
+
+  Utilities:
+    acc.raw                    — Original unmodified dict.
+    acc.to_search_dict()       — Clean dict keyed by canonical CSV headers.
+                                 Useful during gradual migration.
+
+Key aliases handled automatically:
+    "Article Title", "Title", "title" → acc.title
+    "Publication Title", "Journal", "journal_name", "Venue" → acc.container_title
+    "Authors", "Author" → acc.authors
+    "Year", "Date", "pub_year" → acc.year
+    "DOI", "doi" → acc.doi
+
+
+4b. check_author_overlap(citation_authors, api_authors, author_format)
+----------------------------------------------------------------------
+
+Compares author surnames using Jaro-Winkler distance (threshold 0.9).
+
+Parameters:
+    citation_authors : str
+        Semicolon- or comma-separated author string from the citation.
+    api_authors : list
+        Author data from the API response.
+    author_format : str
+        "structured" — list of dicts with a 'family' key.
+            Used by: Crossref.
+            Example: [{"given": "John", "family": "Smith"}, ...]
+        "names" — list of plain name strings.
+            Used by: DBLP, PubMed, ArXiv, Open Library, Google Books.
+            Example: ["John Smith", "Jane Doe"]
+
+Returns: (bool matched_at_least_one, int overlap_count)
+
+Example:
+    author_matched, author_count = check_author_overlap(
+        acc.authors,         # "Smith, J.; Doe, A."
+        api_authors,         # ["John Smith", "Alice Doe"]
+        author_format="names"
+    )
+
+
+4c. years_match(year_a, year_b, tolerance=1)
+---------------------------------------------
+
+Compares two year values.  Returns True if within tolerance.
+
+Accepts str, int, float, or None.  Gracefully returns True when either
+side is missing or unparseable — absence of evidence never penalizes.
+
+Parameters:
+    year_a, year_b : str | int | float | None
+    tolerance : int — Maximum allowed difference (default 1).
+
+Examples:
+    years_match("2019", "2020")         → True  (within tolerance)
+    years_match(2019, 2021)             → False (outside tolerance)
+    years_match("2019", None)           → True  (missing = non-penalizing)
+    years_match("circa 2019", "2019")   → True  (extracts embedded year)
+
+
+4d. normalize_for_api(text) vs normalize_title(text)
+-----------------------------------------------------
+
+Two normalization functions for different purposes:
+
+  normalize_for_api(text):
+    Light normalization for API queries.
+    Lowercases, strips trailing punctuation, collapses whitespace.
+    KEEPS hyphens (important for query formatting).
+    Use when building search queries to send to APIs.
+
+  normalize_title(text):
+    Strict normalization for fuzzy comparison.
+    Unidecode (accent removal), lowercase, strips ALL punctuation,
+    collapses whitespace.
+    Used internally by compute_title_score() and the distinctive-token
+    penalty.  Validators generally don't call this directly.
+
+
+4e. compute_title_score(citation_title, matched_title)
+------------------------------------------------------
+
+Multi-metric title similarity with distinctive-token penalty.
+Returns 0.0 to 1.0.
+
+This is called by the ScoringPipeline — validators do NOT call this.
+It's documented here so you understand what the pipeline does with
+the raw titles you provide on MatchCandidate.
+
+Formula:
+    raw = 0.4 × token_set_ratio + 0.4 × token_sort_ratio + 0.2 × WRatio
+    penalty = compute_distinctive_token_penalty(normalized_a, normalized_b)
+    final = raw × penalty
+
+The distinctive-token penalty discounts shared academic vocabulary
+(words like "learning", "network", "model", "analysis") so that two
+papers sharing only common terms aren't treated as similar.
+
+IMPORTANT: If either input string is empty, the function returns 0.0.
+This is why citation_title must always be populated on MatchCandidate —
+the pipeline calls compute_title_score(candidate.citation_title,
+candidate.matched_title), and an empty citation_title produces 0.0
+regardless of how good the matched_title is.
+
+
+4f. calculate_title_similarity(title1, title2, substring_boost=False)
+---------------------------------------------------------------------
+
+Single-metric title similarity using token_sort_ratio.
+Returns 0.0 to 1.0.
+
+This is what validators use for LOCAL candidate filtering and
+best-candidate selection.  It's faster than compute_title_score()
+and sufficient for filtering purposes.
+
+Parameters:
+    substring_boost : bool
+        When True, if either normalized title is fully contained within
+        the other (and is at least 3 words), return 1.0 immediately.
+
+        USE THIS FOR BOOK VALIDATORS.  Book APIs frequently return
+        titles with subtitles:
+            Citation: "Design Patterns"
+            API:      "Design Patterns: Elements of Reusable Object-Oriented Software"
+        Without substring_boost, this scores ~0.55.  With it, it's 1.0.
+
+        Validators that use substring_boost=True:
+            Google Books, Open Library.
+
+        Validators that use the default (False):
+            Crossref, DBLP, PubMed, ArXiv.
+
+
+4g. FileHandler — File Reading Utility
+---------------------------------------
+
+    from file_handler import FileHandler
+
+FileHandler provides convenience methods for file I/O used by
+extractors.  It is part of the application's standard library — no
+DEPENDENCIES declaration needed.
+
+  FileHandler.read_text_file(filepath: str) → str
+      Reads a text-based file and returns its content as a string.
+      Handles encoding detection for common text formats (txt, html,
+      csv, md, xml, json, rtf).  Used by the Gemini and ChatGPT
+      extractors as an alternative to direct open() calls.
+
+      Returns the file content as a string.  Raises an exception if
+      the file cannot be read.
+
+  FileHandler.validate_file(filepath: str)
+      Validates that a file path exists and is readable.
+      Raises ValueError if the file is missing or inaccessible.
+      Call this early in extract() if you want a clean error message.
+
+  FileHandler.is_url(text: str) → bool
+      Returns True if the input string looks like a URL (http/https).
+      Used by the extraction runner to distinguish URL inputs from
+      local file paths.
+
+  FileHandler.download_to_temp(url: str) → str
+      Downloads a URL to a temporary file and returns the temp path.
+      The caller is responsible for deleting the temp file afterward.
+
+  FileHandler.scan_directory(dir_path: str) → List[str]
+      Returns a list of supported file paths in a directory.
+      Used by the batch extraction runner.
+
+
+================================================================================
+5. SCORING PIPELINE
+================================================================================
+
+
+5a. HOW MATCHCANDIDATES BECOME VALIDATIONRESULTS
+-------------------------------------------------
+
+When a Tier 1 validator returns a MatchCandidate, the
+ValidatorManager._resolve_result() routes it to ScoringPipeline.score().
+
+The pipeline:
+  1. Checks if doi_verified or direct_id_verified is True → DOI/ID cross-check path.
+  2. Otherwise, computes weighted average of title, author, year components.
+  3. Applies author anti-overlap penalty.
+  4. Maps the final score to a status string.
+  5. Returns a ValidationResult.
+
+Validators should NOT compute final scores.  They provide raw signals;
+the pipeline ensures consistency.
+
+
+5b. WEIGHTED AVERAGE MODEL
+---------------------------
+
+    raw = (W_TITLE × title + W_AUTHOR × author + W_YEAR × year)
+          / (W_TITLE + W_AUTHOR + W_YEAR)
+
+    final = raw × author_penalty
+    display = round(final × 100)
+
+Component Weights (sum = 5.0):
+    W_TITLE  = 3.0   (~60% of score)
+    W_AUTHOR = 1.5   (~30% of score)
+    W_YEAR   = 0.5   (~10% of score)
+
+Title Score (0.0-1.0):
+    Computed by compute_title_score() from citation_title + matched_title.
+    The pipeline calls compute_title_score(candidate.citation_title,
+    candidate.matched_title) using the MatchCandidate's fields directly.
+
+    CRITICAL: If citation_title is empty, compute_title_score() returns
+    0.0.  There is no fallback — the pipeline does NOT reconstruct the
+    citation title from the original citation_data dict.  You MUST
+    populate citation_title on your MatchCandidate (typically from
+    acc.title) for the weighted average to produce a meaningful score.
+
+Author Score (0.0-1.0):
+    Computed from overlap_count / citation_author_count with scaling:
+        0 overlap       → 0.0
+        1 overlap       → ratio × 0.9
+        2 overlapping   → ratio × 1.05 (capped at 1.0)
+        3+ overlapping  → ratio × 1.1  (capped at 1.0)
+
+Year Score (0.0 or 1.0):
+    1.0 if years match within tolerance (default ±1), 0.0 otherwise.
+    Missing year on either side returns 1.0 (non-penalizing).
+
+
+5c. TITLE GATE
+--------------
+
+If the pipeline's computed title_score < 0.30, the match is rejected
+immediately as "Not Validated" with score 0, WITHOUT computing other
+components.  This prevents author/year signals from inflating the
+score of a title mismatch.
+
+
+5d. DOI/ID CROSS-CHECK
+-----------------------
+
+When doi_verified=True or direct_id_verified=True:
+
+  The pipeline bypasses the weighted average and instead cross-checks
+  resolved_title against citation_title:
+
+    cross_sim >= 0.70 → Validated (score 100)
+    cross_sim >= 0.40 → Not Validated (partial mismatch)
+    cross_sim <  0.40 → Not Validated (DOI mismatch / fabricated)
+
+  If resolved_title is EMPTY, the result is Not Validated with an error.
+
+  CRITICAL: When you set doi_verified=True or direct_id_verified=True,
+  you MUST populate BOTH of these on the MatchCandidate:
+
+    resolved_title  — The title returned by the API for the resolved
+                      identifier.  If empty, the pipeline returns "Not
+                      Validated" with an error message about the missing
+                      resolved title.
+
+    citation_title  — The title from the original citation (acc.title).
+                      The pipeline cross-checks resolved_title against
+                      this value.  If citation_title is empty, the
+                      cross-check computes similarity("", resolved_title)
+                      which returns 0.0, producing "Not Validated" —
+                      even though the identifier resolved successfully.
+
+  This means a citation with a valid DOI but no title in the CSV will
+  fail the cross-check.  This is by design — the pipeline cannot confirm
+  that the DOI belongs to the correct citation without a title to compare.
+
+
+5e. AUTHOR ANTI-OVERLAP PENALTY
+--------------------------------
+
+Post-hoc multiplier applied to the final weighted-average score:
+
+    < 3 citation authors         → 1.0  (too few to judge)
+    0 overlap with 3+ authors    → 0.7  (red flag)
+    ≤ 20% overlap with 3+ authors → 0.85 (suspicious)
+
+This catches cases where a match has zero author overlap despite the
+citation listing many authors — a strong signal the candidate is a
+different paper on the same topic.
+
+
+5f. STATUS VOCABULARY & THRESHOLDS
+-----------------------------------
+
+    "Validated"      — display score >= 80
+    "Possible Match" — display score 60-79
+    "Not Validated"  — display score < 60 (hard floor: displayed as 0)
+
+
+5g. ScoringPipeline CONSTANTS AVAILABLE TO VALIDATORS
+------------------------------------------------------
+
+    from scoring import ScoringPipeline
+
+    ScoringPipeline.TITLE_GATE               — 0.30 (title gate cutoff)
+        Use this as your local filtering threshold.
+        Example:
+            if sim < ScoringPipeline.TITLE_GATE:
+                continue
+
+    ScoringPipeline.VALIDATED_THRESHOLD      — 80 (display score for "Validated")
+    ScoringPipeline.HARD_FLOOR               — 60 (below this → score 0)
+
+    ScoringPipeline.DOI_CROSS_HIGH           — 0.70 (DOI cross-check confirm)
+    ScoringPipeline.DOI_CROSS_LOW            — 0.40 (DOI cross-check partial)
+
+    ScoringPipeline.STATUS_VALIDATED         — "Validated"
+    ScoringPipeline.STATUS_POSSIBLE          — "Possible Match"
+    ScoringPipeline.STATUS_NOT_VALIDATED     — "Not Validated"
+
+    ScoringPipeline.W_TITLE                  — 3.0
+    ScoringPipeline.W_AUTHOR                 — 1.5
+    ScoringPipeline.W_YEAR                   — 0.5
+
+
+================================================================================
+6. ARTIFACT SCHEMAS
+================================================================================
+
+
+6a. CSV HEADERS (EXTRACTOR OUTPUT)
+-----------------------------------
+
+Available via: from config import Config; Config.CSV_HEADERS
+
+    "Citation Number", "Type", "Authors", "Article Title",
+    "Publication Title", "Series", "Editor", "Volume", "Issue",
+    "Publisher", "Publication Location", "Year", "Month", "Day",
+    "Pages", "Edition", "Institution", "DOI", "ISBN", "ISSN",
+    "URL", "Date Accessed"
+
+Type must be one of:
+    "Journal Article", "Conference Paper", "Book", "Book Chapter",
+    "Thesis", "Report", "Website", "Magazine Article",
+    "Newspaper Article", "Encyclopedia Entry", "Other"
+
+Authors: semicolon-separated, "Surname, Initials" format.
+    Example: "Smith, J.; Doe, A.; Johnson, B. R."
+
+
+6b. MatchCandidate FIELDS (COMPLETE CONSTRUCTOR REFERENCE)
+-----------------------------------------------------------
+
+All fields with their types, defaults, and usage notes.
+Import: from scoring import MatchCandidate
+
+    MatchCandidate(
+        # ── Required ──────────────────────────────────────────────
+        source_name: str,
+            # Your validator's name property.
+
+        # ── Title fields ──────────────────────────────────────────
+        citation_title: str = "",
+            # *** ALWAYS POPULATE THIS (from acc.title) ***
+            #
+            # The title from the original citation.  The pipeline uses
+            # this with matched_title to compute title similarity via
+            # compute_title_score().
+            #
+            # If empty, compute_title_score("", matched_title) returns
+            # 0.0, triggers the title gate, and produces "Not Validated"
+            # with score 0 — regardless of how good the match is.
+            #
+            # For DOI/ID-verified matches, this is also used in the
+            # cross-check against resolved_title.  An empty value means
+            # similarity = 0.0, producing "Not Validated" even when the
+            # identifier resolved successfully.
+            #
+            # Set to acc.title in ALL code paths that return a
+            # MatchCandidate (both title-search and ID-lookup paths).
+
+        matched_title: str = "",
+            # The title returned by the API for the candidate match.
+            # Required for the pipeline to compute title score.
+
+        resolved_title: str = "",
+            # Title from DOI/ID resolution.
+            # REQUIRED when doi_verified=True or direct_id_verified=True.
+            # The pipeline cross-checks this against citation_title.
+            # Leave empty for non-DOI/non-ID matches.
+
+        # ── Author fields ─────────────────────────────────────────
+        matched_authors: List[str] = [],
+            # Author names from the API response (list of strings).
+            # Used in the report for human auditing.
+
+        author_overlap_matched: bool = False,
+            # True if at least one citation author surname matched
+            # an API author surname (from check_author_overlap).
+
+        author_overlap_count: int = 0,
+            # How many citation author surnames matched API authors.
+            # Used by the pipeline to compute the author score.
+
+        citation_author_count: int = 0,
+            # *** ALWAYS POPULATE THIS (from acc.author_count) ***
+            #
+            # Total authors in the citation.  Used by the pipeline for
+            # the author score calculation and anti-overlap penalty.
+            #
+            # If 0, the author component of the score (~30%) won't be
+            # computed meaningfully, and the anti-overlap penalty
+            # (which only fires for 3+ authors) cannot activate.
+
+        # ── Year fields ───────────────────────────────────────────
+        matched_year: str = "",
+            # Publication year from API response (as string).
+
+        year_matched: bool = True,
+            # True if years match within tolerance (from years_match).
+
+        # ── Identifier verification ───────────────────────────────
+        doi_verified: bool = False,
+            # True ONLY if you performed a direct DOI lookup that
+            # succeeded (the API returned a record for this DOI).
+            # When True, you MUST populate both resolved_title AND
+            # citation_title.
+            # Triggers the cross-check path (bypasses weighted average).
+
+        direct_id_verified: bool = False,
+            # True ONLY if you performed a direct identifier lookup
+            # (PMID, ISBN, ArXiv ID, etc.) that succeeded.
+            # When True, you MUST populate both resolved_title AND
+            # citation_title.
+            # Triggers the cross-check path (bypasses weighted average).
+
+        # ── Debugging / metadata ──────────────────────────────────
+        title_similarity: float = 0.0,
+            # Optional.  Your locally-computed title similarity.
+            # The pipeline recomputes its own score from raw titles,
+            # so this is NOT used in scoring.  It's stored for
+            # debugging and report transparency.
+
+        result_rank: int | None = None,
+            # 1-indexed position in search results.
+            # Tracked in details for debugging only — NOT scored.
+            # Set to None for direct ID lookups.
+
+        evidence_links: List[str] = [],
+            # URLs for human auditing.
+            # Include: API record URL, DOI link, database permalink.
+
+        raw_metadata: Dict = {},
+            # Full API response for debugging.
+            # Stored on the ValidationResult for report generation.
+
+        match_details: str = "",
+            # Free-text description of what was found.
+            # Example: "Found match (rank #2): 'Paper Title Here'"
+            # Included in the ValidationResult.details.
+    )
+
+
+6c. ValidationResult FIELDS
+----------------------------
+
+Import: from validators_plugin.base import ValidationResult
+
+    ValidationResult(
+        source_name: str,           # Your validator's name.
+        status: str,                # "Validated", "Possible Match",
+                                    # "Not Validated", "Error",
+                                    # or "Validation Error".
+        confidence_score: int,      # 0-100 integer.
+        details: str,               # Human-readable explanation.
+        evidence_links: List[str] = [],   # URLs to the source.
+        metadata: Dict = {},        # Raw response for debugging.
+    )
+
+
+================================================================================
+7. CONFIGURATION SYSTEM
+================================================================================
+
+
+7a. PLUGIN CONFIGURATION (self.config)
+--------------------------------------
+
+Configuration is fully managed by the base classes.  You do NOT need to
+implement config loading, saving, or path resolution.
+
+Lifecycle (handled by BaseExtractor/BaseValidator automatically):
+    1. __init__ calls your get_default_settings() → populates self.config
+    2. __init__ looks for {ClassName}_Config.json and merges overrides
+    3. If no JSON file exists, one is created with your defaults
+
+Config path resolution (in order):
+    1. External: {app_root}/{plugin_dir}/{ClassName}_Config.json
+       (user-editable, survives updates)
+    2. Fallback: {base.py directory}/{ClassName}_Config.json
+
+Reading settings in your code:
+    value = self.config["KEY_NAME"]
+    value = self.config.get("KEY_NAME", default_value)
+
+GUI changes call update_setting(key, value), which writes to disk.
+
+What you implement:
+    get_default_settings() → Dict[str, Any]
+        Return ALL settings your plugin uses with sensible defaults.
+        Include placeholder strings for API keys: "YOUR_KEY_HERE"
+        Include rate limiting settings: REQUEST_DELAY, TIMEOUT, MAX_RETRIES
+        Include search parameters: MAX_RESULTS, YEAR_MATCH_TOLERANCE
+        Every key you read from self.config must exist in defaults.
+
+
+7b. APPLICATION-LEVEL CONFIGURATION (the config module)
+-------------------------------------------------------
+
+The application uses a ``config`` module (imported as ``import config``
+or ``import config as cfg``) that exposes bare module-level global
+variables controlling runtime behavior.  These are separate from the
+``Config`` class used for CSV_HEADERS.
+
+Key globals used by the managers (plugin authors rarely need these
+directly, but knowing they exist helps understand the orchestration):
+
+    config.DEBUG_MODE              — bool.  When True, enables verbose
+                                    logging in base classes and managers.
+
+    config.ACTIVE_EXTRACTOR        — str.  The name of the currently
+                                    selected extractor.  The
+                                    ExtractionManager uses this to pick
+                                    which extractor to run.
+
+    config.LLM_ENABLED             — bool.  Whether Tier 2 (Deep Research)
+                                    validators are invoked when Tier 1 fails.
+
+    config.LLM_CONFIDENCE_THRESHOLD — int.  If the best Tier 1 result's
+                                    confidence_score is below this value
+                                    AND LLM_ENABLED is True, Tier 2
+                                    validators are invoked.
+
+    config.SATISFIED_THRESHOLD     — int.  How many "Validated" results
+                                    from Tier 1 validators before the
+                                    manager stops running additional
+                                    validators for a citation.
+
+    config.ADAPTIVE_ORDERING       — bool.  When True, Tier 1 validators
+                                    are sorted by historical success count
+                                    (most successful first).
+
+    config.REPORT_SPLIT_MODE       — str.  Controls report output:
+                                    "merged", "split", or "both".
+
+
+================================================================================
+8. PLUGIN DISCOVERY & MANAGER INTERNALS
+================================================================================
+
+How plugins are found at runtime:
+
+  1. The manager imports all .py files in its package directory
+     (extraction_plugins/ or validators_plugin/), skipping __init__.py,
+     base.py, manager.py, and *_prompts.py.
+
+  2. The manager scans the external drop-in directory:
+     {app_root}/plugins/extraction/ or {app_root}/plugins/validators/
+
+  3. After all imports, the manager calls BaseExtractor.__subclasses__()
+     or BaseValidator.__subclasses__() to find all registered classes.
+
+  4. Each discovered class is instantiated.  If instantiation fails
+     (e.g. missing dependency), the error is logged and the plugin
+     is skipped.  Other plugins continue to work.
+
+  5. Deduplication prevents the same class from being instantiated twice
+     if found via both internal and external paths.
+
+Validator ordering:
+  - Tier 1 validators are stored in manager.primary_validators
+  - Tier 2 validators are stored in manager.research_validators
+  - If cfg.ADAPTIVE_ORDERING is True, Tier 1 validators are sorted by
+    historical success count (most successful first)
+
+ValidatorManager.validate_citation() orchestration:
+  1. Run all enabled Tier 1 validators.
+  2. For each, call validate() and pass through _resolve_result().
+  3. Track the best result (highest confidence_score).
+  4. Stop early if cfg.SATISFIED_THRESHOLD validated confirmations reached.
+  5. If best result's confidence < cfg.LLM_CONFIDENCE_THRESHOLD and
+     cfg.LLM_ENABLED is True, run Tier 2 validators.
+  6. Return the overall best result.
+
+Error isolation:
+  - Validators: Each validate() call is wrapped in try/except by the
+    ValidatorManager.  An unhandled exception produces an error
+    ValidationResult; other validators continue normally.
+  - Extractors: The ExtractionManager does NOT catch exceptions from
+    extract().  Exceptions propagate to the extraction runner, which
+    catches them at the top level and aborts the job.  This is why
+    extractors must catch their own exceptions and return "".
+
+
+================================================================================
+9. INSTALLATION INSTRUCTIONS
+================================================================================
+
+Method 1: Plugin Installer (recommended)
+
+    1. Save your .py file following the patterns in this guide.
+       Ensure it:
+         a. Inherits from BaseExtractor or BaseValidator.
+         b. Has the @register_extractor or @register_validator decorator.
+            For Tier 2 validators, include BOTH @register_validator
+            AND @deep_research_validator.
+         c. Optionally declares a DEPENDENCIES class-level list.
+    2. Use File > Install Plugin... in the application menu.
+    3. The PluginInstaller will:
+         a. Parse the AST to verify inheritance and decorator.
+         b. Extract and pip-install any declared DEPENDENCIES.
+         c. Copy the file to extraction_plugins/ or validators_plugin/.
+         d. Reject the file if a plugin with the same filename already exists.
+    4. Restart the application to reload managers.
+
+Method 2: Manual drop-in
+
+    Place extractor files in:  plugins/extraction/
+    Place validator files in:  plugins/validators/
+
+    The managers scan these directories on startup.  The @register
+    decorator is optional for drop-in plugins (subclass discovery
+    works via __subclasses__()), but recommended for consistency.
+
+    You must manually install any pip dependencies before dropping
+    in the file.
+
+Configuration files ({ClassName}_Config.json) are created automatically
+on first instantiation.  Edit via File > Configuration... or directly
+in the JSON file.
+
+After installation, restart the application.  The new plugin will
+appear in the UI's extractor/validator selection.
+
+
+================================================================================
+10. COMMON PITFALLS
+================================================================================
+
+This section covers mistakes that cause plugins to install successfully
+and run without errors, but silently produce wrong scores.  These are
+worse than crashes because the plugin appears to work.
+
+
+PITFALL 1: Missing citation_title on MatchCandidate
+----------------------------------------------------
+
+SYMPTOM: Your validator finds correct matches from the API, but the
+pipeline scores every result as "Not Validated" with score 0.
+
+CAUSE: The MatchCandidate was returned without citation_title populated.
+The pipeline calls compute_title_score(candidate.citation_title,
+candidate.matched_title).  With citation_title="" this returns 0.0,
+which triggers the title gate (< 0.30), and the match is rejected
+before author or year signals are even considered.
+
+This affects BOTH code paths:
+  - Title-search: score = 0 because compute_title_score("", matched_title) = 0.0
+  - DOI/ID-verified: "Not Validated" because cross-check similarity("",
+    resolved_title) = 0.0, which is below the 0.40 threshold
+
+FIX: Always set citation_title=acc.title on every MatchCandidate you
+return, in BOTH title-search and DOI/ID-lookup code paths.
+
+
+PITFALL 2: Missing citation_author_count on MatchCandidate
+-----------------------------------------------------------
+
+SYMPTOM: Author matching works (author_overlap_count is correct) but
+the author component of the score is lower than expected.  The
+anti-overlap penalty never fires even for zero-overlap cases.
+
+CAUSE: citation_author_count defaults to 0.  The pipeline computes
+the author score as overlap_count / max(citation_author_count, 1),
+so the ratio is computed against 1 instead of the real count.  The
+anti-overlap penalty (which only applies when citation_author_count
+>= 3) never activates.
+
+FIX: Always set citation_author_count=acc.author_count.
+
+
+PITFALL 3: Missing resolved_title with doi_verified=True
+----------------------------------------------------------
+
+SYMPTOM: DOI resolves successfully at the API but the pipeline returns
+"Not Validated" with a message about the missing resolved_title.
+
+FIX: When doi_verified=True or direct_id_verified=True, always set
+resolved_title to the title returned by the API for the resolved
+identifier.  Also set citation_title (see Pitfall 1).
+
+
+PITFALL 4: Extractor raises instead of returning ""
+----------------------------------------------------
+
+SYMPTOM: An extraction error crashes the job with a traceback instead
+of producing a clean "extraction failed" message.
+
+CAUSE: Unlike validators (which are wrapped in try/except by the
+ValidatorManager), the ExtractionManager does NOT wrap extract().
+An unhandled exception propagates to the extraction runner and aborts
+the entire job.
+
+FIX: Wrap your extract() method's logic in try/except and return ""
+on any failure.  Log the error with print() for debugging:
+
+    def extract(self, filepath: str) -> str:
+        try:
+            # ... your extraction logic ...
+            return csv_output
+        except Exception as e:
+            print(f"[{self.name}] Extraction failed: {e}")
+            return ""
+
+
+PITFALL 5: Tier 2 validator missing @register_validator
+-------------------------------------------------------
+
+SYMPTOM: The Plugin Installer rejects your Tier 2 validator file, even
+though it works when manually dropped into the plugins directory.
+
+CAUSE: The installer's AST check requires @register_validator.
+@deep_research_validator alone is not sufficient for the installer,
+even though runtime discovery via __subclasses__() would find the class.
+
+FIX: Always use BOTH decorators for Tier 2:
+
+    @register_validator
+    @deep_research_validator
+    class MyResearchValidator(BaseValidator):
+        ...
+
+
+PITFALL 6: is_configured() not overridden for no-config plugins
+----------------------------------------------------------------
+
+SYMPTOM: The UI flags your programmatic extractor/validator as needing
+configuration and directs the user to a settings page, even though
+there is nothing to configure.
+
+CAUSE: The base class defaults is_configured() to False.  The
+application interprets this as "the plugin needs attention" and
+actively steers the user to the settings page.
+
+FIX: For plugins that don't need any configuration, override
+is_configured() to return True:
+
+    def is_configured(self) -> bool:
+        return True  # No configuration needed
+
+is_configured() should only return False if the plugin genuinely needs
+the user to set something before it can produce meaningful results.
+
+
+PITFALL 7: Referencing non-existent ScoringPipeline attributes
+---------------------------------------------------------------
+
+SYMPTOM: AttributeError at runtime when filtering candidates.
+
+CAUSE: Using attribute names that don't exist on ScoringPipeline.
+
+CORRECT constant names (see Section 5g for the full list):
+
+    ScoringPipeline.TITLE_GATE             — 0.30 (for local filtering)
+    ScoringPipeline.STATUS_VALIDATED       — "Validated"
+    ScoringPipeline.STATUS_NOT_VALIDATED   — "Not Validated"
+    ScoringPipeline.STATUS_POSSIBLE        — "Possible Match"
+
+
+================================================================================
+END OF DOCUMENT
+================================================================================

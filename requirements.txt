@@ -1,0 +1,23 @@
+# --- System Requirements (Linux) ---
+# sudo apt install python3-tk python3-venv  (Debian/Ubuntu)
+# sudo dnf install python3-tkinter          (Fedora)
+# macOS Homebrew: brew install python-tk@3.x
+
+# --- File Handling & Processing ---
+pypdf>=6.6.2            # PDF text extraction
+striprtf~=0.0.26        # RTF to plain text conversion
+unidecode~=1.3.0        # Sanitize text to ASCII-safe formats
+
+# --- Extraction & Validation Plugins ---
+openai~=1.12.0          # Required for ChatGPTExtractor and ChatGPTValidator
+google-genai~=1.60.0    # Required for GeminiExtractor and GeminiResearchValidator
+requests~=2.32.4        # Required for DBLP, Google Books, JSTOR, WorldCat, and Open Library
+habanero~=1.2.3         # Crossref API wrapper
+biopython~=1.81         # PubMedValidator (Bio.Entrez)
+arxiv~=2.1.0            # ArXiv API client
+
+# --- Utilities & Logic ---
+rapidfuzz~=3.6.0        # Required for title similarity and author overlap in utils.py
+
+# --- Misc. ---
+Pillow
