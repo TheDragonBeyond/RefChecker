@@ -104,7 +104,7 @@ The settings editor has three tabs: **Global**, **Extractors**, and **Validators
 
 The warning banner will disappear once the active extractor has a valid key.
 
-> **Good news:** The six Tier 1 validators (Crossref, DBLP, ArXiv, PubMed, Open Library, Google Books) require **no API keys** and work immediately. The only plugins that need keys are the two Gemini-based ones — the extractor and the Gemini Research Agent validator.
+> **Good news:** The four of the Tier 1 validators (Crossref, DBLP, ArXiv, , Open Library) require **no API keys** or setup and work immediately. The only plugins that need keys are the three Google-based ones — the extractor the Gemini Research Agent validator, The Google Books validator, and PubMed requires an email.
 
 ### Choosing Models
 
@@ -407,12 +407,13 @@ Uses Google Gemini to perform a holistic assessment of a citation. Given the cit
 
 **Status vocabulary:** The Gemini Research Agent uses three categories: "Validated" (formal academic publication found), "Ambiguous" (non-standard source like a blog, repository, or product page exists and matches), and "Not Validated" (cannot find the work or link is dead). Each response includes a reasoning explanation, a verification note, and evidence links (DOI URL, Google Scholar link, publisher link, and any additional URLs).
 
-| Setting | Default | Description |
-|---|---|---|
-| `API_KEY` | `YOUR_KEY_HERE` | Your Google GenAI API key. |
-| `MODEL_NAME` | `gemini-2.5-flash` | Which Gemini model to use. |
-| `TEMPERATURE` | `0.0` | Generation temperature. |
-| `TIMEOUT` | `30` | Request timeout in seconds. |
+| Setting | Default          | Description |
+|---|------------------|---|
+| `API_KEY` | `YOUR_KEY_HERE`  | Your Google GenAI API key. |
+| `MODEL_NAME` | `gemini-2.5-Pro` | Which Gemini model to use. |
+| `TEMPERATURE` | `0.0`            | Generation temperature. |
+| `TIMEOUT` | `30`             | Request timeout in seconds. |
+> **Tip:** Flash models often will hallucinate if given a DOI, so use a pro model here. 
 
 ### How Scoring Works
 

@@ -25,7 +25,7 @@ class GeminiResearchValidator(BaseValidator):
     def get_default_settings(self) -> Dict[str, Any]:
         return {
             "API_KEY": "YOUR_KEY_HERE",
-            "MODEL_NAME": "gemini-2.5-flash",
+            "MODEL_NAME": "gemini-2.5-pro",
             "TEMPERATURE": 0.0,
             "TIMEOUT": 30
         }
