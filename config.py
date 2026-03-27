@@ -18,6 +18,7 @@ DEFAULTS = {
     "OUTPUT_SUFFIX": "_references.csv",
     "REPORT_SPLIT_MODE": "merged",
     "ENABLED_VALIDATORS": None,
+    "PROOF_ISBN_USE_GOOGLE_BOOKS": False,
     # --- Directory Memory Defaults (relative to app base) ---
     "LAST_DIR_EXTRACTION_INPUT": "source",   # Remembers where you pull docs from
     "LAST_DIR_EXTRACTION_OUTPUT": "output",  # Remembers where you save docs to
@@ -212,7 +213,8 @@ LLM_ENABLED = _current_settings["LLM_ENABLED"]
 LLM_CONFIDENCE_THRESHOLD = _current_settings["LLM_CONFIDENCE_THRESHOLD"]
 ACTIVE_EXTRACTOR = _current_settings["ACTIVE_EXTRACTOR"]
 REPORT_SPLIT_MODE = _current_settings["REPORT_SPLIT_MODE"]
-ENABLED_VALIDATORS = _current_settings["ENABLED_VALIDATORS"] # NEW
+ENABLED_VALIDATORS = _current_settings["ENABLED_VALIDATORS"]
+PROOF_ISBN_USE_GOOGLE_BOOKS = _current_settings["PROOF_ISBN_USE_GOOGLE_BOOKS"]
 
 
 # --- Class-Level Exposure ---
@@ -232,7 +234,8 @@ class Config:
         # Update Module Globals
         global DEBUG_MODE, OUTPUT_ENCODING, SATISFIED_THRESHOLD, \
             ADAPTIVE_ORDERING, LLM_ENABLED, LLM_CONFIDENCE_THRESHOLD, \
-            ACTIVE_EXTRACTOR, REPORT_SPLIT_MODE, ENABLED_VALIDATORS
+            ACTIVE_EXTRACTOR, REPORT_SPLIT_MODE, ENABLED_VALIDATORS, \
+            PROOF_ISBN_USE_GOOGLE_BOOKS
 
         DEBUG_MODE = _current_settings["DEBUG_MODE"]
         OUTPUT_ENCODING = _current_settings["OUTPUT_ENCODING"]
@@ -242,7 +245,8 @@ class Config:
         LLM_CONFIDENCE_THRESHOLD = _current_settings["LLM_CONFIDENCE_THRESHOLD"]
         ACTIVE_EXTRACTOR = _current_settings["ACTIVE_EXTRACTOR"]
         REPORT_SPLIT_MODE = _current_settings["REPORT_SPLIT_MODE"]
-        ENABLED_VALIDATORS = _current_settings["ENABLED_VALIDATORS"] # NEW
+        ENABLED_VALIDATORS = _current_settings["ENABLED_VALIDATORS"]
+        PROOF_ISBN_USE_GOOGLE_BOOKS = _current_settings["PROOF_ISBN_USE_GOOGLE_BOOKS"]
 
         # Update Class Attributes
         Config.OUTPUT_SUFFIX = _current_settings["OUTPUT_SUFFIX"]

@@ -1,4 +1,8 @@
 # validators_plugin/base.py
+#
+# v2 CHANGES (LLM Pipeline):
+#   - validate() return type updated to include LLMCandidate
+#   - Docstring documents the three-way dispatch
 
 import sys
 from abc import ABC, abstractmethod
@@ -142,22 +146,26 @@ class BaseValidator(ABC):
         pass
 
     @abstractmethod
-    def validate(self, citation_data: Dict[str, str]) -> 'Union[ValidationResult, MatchCandidate]':
+    def validate(self, citation_data: Dict[str, str]) -> 'Union[ValidationResult, MatchCandidate, LLMCandidate]':
         """
         Validate a citation against this plugin's data source.
 
-        Returns either:
-          - ValidationResult: For errors, skips, not-found cases, or LLM
-            validators that produce their own holistic assessment.
+        Returns one of three types, dispatched by ValidatorManager._resolve_result():
+
           - MatchCandidate: Raw match signals (title similarity, author
-            overlap, year match, etc.) that the ScoringPipeline will
-            convert into a ValidationResult using centralized weights.
+            overlap, year match, etc.) from programmatic validators.
+            Routed to ScoringPipeline.score() for weighted-average scoring.
 
-        Existing validators returning ValidationResult continue to work
-        unchanged. New or migrated validators can return MatchCandidate
-        to benefit from consistent, comparable scoring.
+          - LLMCandidate: Structured output from LLM validators, with
+            explicit identifier fields and metadata.  Routed to
+            LLMScoringPipeline.score() for proof verification, cross-
+            checking, and calibrated scoring.
 
-        The ValidatorManager handles both types transparently via
-        _resolve_result().
+          - ValidationResult: Already-scored result for errors, skips,
+            and edge cases.  Passed through without further processing.
+
+        Programmatic validators should return MatchCandidate.
+        LLM/deep-research validators should return LLMCandidate.
+        Both types may return ValidationResult for error conditions.
         """
         pass

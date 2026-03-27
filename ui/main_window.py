@@ -396,38 +396,46 @@ class CitationApp:
                 self.main_splitter.add(self.bottom_pane)
 
     # --- Thread Runners ---
+
     def run_extraction_thread(self):
-        self._start_thread(self._single_extraction)
-
-    def _single_extraction(self):
+        # FIX: File dialogs MUST run on the main thread (macOS requirement).
+        # We collect all paths here before spawning the background worker.
         inp = self.extraction_file_path.get()
-        if not inp: return
+        if not inp:
+            return
 
-        # 1. Get memory for output directory (resolve relative to absolute)
+        # Resolve initial directory on the main thread
         key = "LAST_DIR_EXTRACTION_OUTPUT"
         stored = config._current_settings.get(key, "output")
         initial = config.resolve_path(stored)
 
-        # 2. Open Save Dialog with resolved absolute path
+        # Show save dialog on the main thread
         out = filedialog.asksaveasfilename(
             defaultextension=".csv",
             initialdir=initial,
             initialfile=Path(inp).stem + "_references.csv"
         )
-        if not out: return
+        if not out:
+            return
 
-        # 3. Save new memory as relative path
+        # Save directory memory on the main thread
         relative_dir = config.to_relative_path(str(Path(out).parent))
         config.save_settings({key: relative_dir})
 
-        # 4. Proceed with Extraction
+        # Now hand off to the background thread with both paths resolved
+        self._start_thread(lambda: self._single_extraction(inp, out))
+
+    def _single_extraction(self, inp, out):
+        # Runs in a background thread — no file dialogs or direct Tk widget
+        # calls here (macOS enforces this strictly).
         self.progress_val.set(10)
         res = run_extraction(inp, out)
         self.progress_val.set(100)
 
-        # 5. Auto-Validate if checked
+        # Auto-Validate if checked
         if res and self.auto_validate.get():
-            self.validation_file_path.set(res)
+            # Schedule the StringVar update safely on the main thread
+            self.root.after(0, lambda: self.validation_file_path.set(res))
             self._execute_validation(res, str(Path(res).with_suffix('')) + "_Validation_Report")
 
     def run_validation_thread(self):

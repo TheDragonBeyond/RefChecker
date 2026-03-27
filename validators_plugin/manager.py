@@ -8,6 +8,12 @@
 #   - Adds {base_dir}/plugins/lib/ to sys.path before loading external
 #     plugins, so that dependencies installed by PluginInstaller via
 #     `pip install --target` are importable in frozen builds.
+#
+# v4 CHANGES (LLM Pipeline):
+#   - _resolve_result() now dispatches three types:
+#       MatchCandidate  → ScoringPipeline.score()
+#       LLMCandidate    → LLMScoringPipeline.score()
+#       ValidationResult → passthrough (errors, skips)
 
 import os
 import sys
@@ -17,6 +23,7 @@ import traceback
 from typing import Dict, List, Set, Type, Union
 from validators_plugin.base import BaseValidator, ValidationResult
 from scoring import MatchCandidate, ScoringPipeline
+from llm_scoring import LLMCandidate, LLMScoringPipeline
 import config as cfg
 import validators_plugin
 
@@ -142,18 +149,24 @@ class ValidatorManager:
     def set_enabled_validators(self, enabled_names: List[str]):
         self.enabled_validators = set(enabled_names)
 
-    def _resolve_result(self, raw: Union[MatchCandidate, ValidationResult]) -> ValidationResult:
+    def _resolve_result(
+        self, raw: Union[MatchCandidate, LLMCandidate, ValidationResult]
+    ) -> ValidationResult:
         """
         Normalizes a validator's return value into a ValidationResult.
 
-        Validators may return either:
-          - MatchCandidate: Raw match signals → routed through ScoringPipeline
-          - ValidationResult: Already scored (errors, skips, LLM validators)
+        Three-way dispatch:
+          - MatchCandidate    → ScoringPipeline.score()     (programmatic validators)
+          - LLMCandidate      → LLMScoringPipeline.score()  (LLM validators)
+          - ValidationResult  → passthrough                  (errors, skips)
 
-        This is the single dispatch point described in the architecture doc.
+        This is the single dispatch point for the entire validation system.
+        Adding a new return type only requires adding one branch here.
         """
         if isinstance(raw, MatchCandidate):
             return ScoringPipeline.score(raw)
+        if isinstance(raw, LLMCandidate):
+            return LLMScoringPipeline.score(raw)
         return raw
 
     def validate_citation(self, citation_data: Dict) -> ValidationResult:
