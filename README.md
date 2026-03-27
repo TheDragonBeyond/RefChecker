@@ -66,7 +66,7 @@ A pre-built frozen release is available as **`RefChecker.zip`**. This bundles th
 
 The included `run.bat` script handles virtual environment creation, dependency installation, and launcher generation.
 
-1. Clone this repository.
+1. Clone this repository. [**Download Source Code (.zip)**](https://github.com/TheDragonBeyond/RefChecker/archive/refs/heads/master.zip)
 2. Ensure Python 3.10+ is installed and available on your PATH.
 3. Double-click **`run.bat`** (or run it from a terminal).
 4. When the script finishes, launch the app via the generated **`CitationUnified.bat`** or the desktop shortcut (if Pillow was available for icon generation).
