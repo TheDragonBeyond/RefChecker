@@ -53,7 +53,7 @@ A modular, plugin-based desktop application that extracts citation data from doc
 
 A pre-built frozen release is available as **`RefChecker.zip`**. This bundles the application into a standalone executable — no Python installation required.
 
-1. [**Download RefChecker.zip**](https://github.com/TheDragonBeyond/RefChecker/releases/download/v1.0.0/RefChecker.zip) from the latest release.
+1. [**Download RefChecker.zip**](https://github.com/TheDragonBeyond/RefChecker/releases/download/1.0.1/RefChecker.zip) from the latest release.
 2. Extract the zip file.
 3. Run the executable inside the extracted folder.
 4. On first launch, you will be prompted to configure your API keys (see [First Launch & Configuration](#first-launch--configuration)).
