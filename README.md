@@ -1,10 +1,12 @@
 # RefChecker
 
 A modular, plugin-based desktop application that extracts citation data from documents, validates references against academic databases and LLMs, and generates comprehensive reports.
-<iframe width="560" height="315" src="https://www.youtube.com/embed/P3pYUauX2ME?si=2neoQYIFVWs8mThf" title="YouTube video player" frameborder="0" allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture; web-share" referrerpolicy="strict-origin-when-cross-origin" allowfullscreen></iframe>
----
 
 ## Table of Contents
+
+<iframe width="560" height="315" src="https://www.youtube.com/embed/P3pYUauX2ME?si=2neoQYIFVWs8mThf" title="YouTube video player" frameborder="0" allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture; web-share" referrerpolicy="strict-origin-when-cross-origin" allowfullscreen></iframe>
+
+---
 
 - [Features](#features)
 - [Installation](#installation)
